@@ -112,106 +112,191 @@ class CSVReconciliationTool:
         header_keywords = [
             'date', 'invoice', 'bill', 'particulars', 'amount', 'gst', 'tax',
             'number', 'no', 'description', 'quantity', 'rate', 'total', 'gstin',
-            'voucher', 'ledger', 'account', 'debit', 'credit', 'balance'
+            'voucher', 'ledger', 'account', 'debit', 'credit', 'balance', 'name',
+            'party', 'customer', 'vendor', 'supplier', 'document', 'reference'
         ]
         
-        for idx, row in df.iterrows():
-            # Convert row to string and check for keywords
-            row_text = ' '.join([str(cell).lower() for cell in row if pd.notna(cell)])
-            keyword_matches = sum(1 for keyword in header_keywords if keyword in row_text)
-            
-            # If we find 2 or more keywords, likely a header row
-            if keyword_matches >= 2:
-                return idx
+        max_keyword_matches = 0
+        header_row_idx = 0
         
-        return 0  # Default to first row if no clear header found
+        # Check first 15 rows for header (most metadata should be within this range)
+        check_rows = min(15, len(df))
+        
+        for idx in range(check_rows):
+            try:
+                row = df.iloc[idx]
+                # Convert row to string and check for keywords
+                row_text = ' '.join([str(cell).lower() for cell in row if pd.notna(cell) and str(cell).strip() != ''])
+                
+                # Count keyword matches
+                keyword_matches = sum(1 for keyword in header_keywords if keyword in row_text)
+                
+                # Also check if row has a good number of non-empty values (likely a header)
+                non_empty_count = sum(1 for cell in row if pd.notna(cell) and str(cell).strip() != '')
+                
+                # Score the row based on keywords and non-empty values
+                score = keyword_matches * 2 + (non_empty_count * 0.1)
+                
+                if score > max_keyword_matches and keyword_matches >= 1:
+                    max_keyword_matches = score
+                    header_row_idx = idx
+                    
+            except Exception:
+                continue
+        
+        return header_row_idx
     
     def preprocess_csv(self, df):
         """Clean and preprocess CSV data"""
-        # Remove completely empty rows and columns
-        df = df.dropna(how='all').dropna(axis=1, how='all')
-        
-        # Detect header row
-        header_idx = self.detect_header_row(df)
-        
-        # Set header and remove metadata rows
-        if header_idx > 0:
-            df.columns = df.iloc[header_idx]
-            df = df.iloc[header_idx + 1:]
-        
-        # Reset index
-        df = df.reset_index(drop=True)
-        
-        # Remove any remaining empty rows
-        df = df.dropna(how='all')
-        
-        # Clean column names
-        df.columns = [str(col).strip() for col in df.columns]
-        
-        return df
+        try:
+            # Remove completely empty rows and columns
+            df = df.dropna(how='all').dropna(axis=1, how='all')
+            
+            # Detect header row
+            header_idx = self.detect_header_row(df)
+            
+            # Set header and remove metadata rows
+            if header_idx > 0:
+                df.columns = df.iloc[header_idx]
+                df = df.iloc[header_idx + 1:]
+            
+            # Reset index
+            df = df.reset_index(drop=True)
+            
+            # Remove any remaining empty rows
+            df = df.dropna(how='all')
+            
+            # Clean column names and handle duplicates
+            cleaned_columns = []
+            column_counts = {}
+            
+            for col in df.columns:
+                # Clean the column name
+                clean_col = str(col).strip()
+                
+                # Handle empty or NaN column names
+                if clean_col == '' or clean_col == 'nan' or clean_col == 'None':
+                    clean_col = 'Unnamed_Column'
+                
+                # Handle duplicate column names
+                if clean_col in column_counts:
+                    column_counts[clean_col] += 1
+                    clean_col = f"{clean_col}_{column_counts[clean_col]}"
+                else:
+                    column_counts[clean_col] = 0
+                
+                cleaned_columns.append(clean_col)
+            
+            df.columns = cleaned_columns
+            
+            # Remove any columns that are still completely empty after processing
+            df = df.dropna(axis=1, how='all')
+            
+            return df
+            
+        except Exception as e:
+            st.error(f"Error processing CSV: {str(e)}")
+            return pd.DataFrame()  # Return empty dataframe on error
     
     def compare_dataframes(self, df_a, df_b, key_a, key_b, cols_a, cols_b):
         """Compare two dataframes and identify differences"""
-        # Ensure key columns exist
-        if key_a not in df_a.columns or key_b not in df_b.columns:
-            st.error("Selected key columns not found in the data!")
-            return None
-        
-        # Create comparison datasets
-        df_a_compare = df_a[[key_a] + cols_a].copy()
-        df_b_compare = df_b[[key_b] + cols_b].copy()
-        
-        # Rename key columns to match
-        df_a_compare = df_a_compare.rename(columns={key_a: 'key'})
-        df_b_compare = df_b_compare.rename(columns={key_b: 'key'})
-        
-        # Find rows only in A
-        only_in_a = df_a_compare[~df_a_compare['key'].isin(df_b_compare['key'])]
-        
-        # Find rows only in B  
-        only_in_b = df_b_compare[~df_b_compare['key'].isin(df_a_compare['key'])]
-        
-        # Find common rows
-        common_keys = set(df_a_compare['key']) & set(df_b_compare['key'])
-        
-        # Find mismatches in common rows
-        mismatches = []
-        for key in common_keys:
-            row_a = df_a_compare[df_a_compare['key'] == key]
-            row_b = df_b_compare[df_b_compare['key'] == key]
+        try:
+            # Ensure key columns exist
+            if key_a not in df_a.columns:
+                st.error(f"Primary key '{key_a}' not found in File A!")
+                return None
+            if key_b not in df_b.columns:
+                st.error(f"Primary key '{key_b}' not found in File B!")
+                return None
             
-            if len(row_a) > 0 and len(row_b) > 0:
-                # Compare selected columns
-                mismatch_found = False
-                mismatch_details = {'key': key}
-                
-                for i, (col_a, col_b) in enumerate(zip(cols_a, cols_b)):
-                    val_a = row_a.iloc[0][col_a] if col_a in row_a.columns else None
-                    val_b = row_b.iloc[0][col_b] if col_b in row_b.columns else None
+            # Ensure comparison columns exist
+            missing_cols_a = [col for col in cols_a if col not in df_a.columns]
+            missing_cols_b = [col for col in cols_b if col not in df_b.columns]
+            
+            if missing_cols_a:
+                st.error(f"Columns not found in File A: {missing_cols_a}")
+                return None
+            if missing_cols_b:
+                st.error(f"Columns not found in File B: {missing_cols_b}")
+                return None
+            
+            # Create comparison datasets
+            df_a_compare = df_a[[key_a] + cols_a].copy()
+            df_b_compare = df_b[[key_b] + cols_b].copy()
+            
+            # Clean the key columns - remove NaN values and convert to string
+            df_a_compare = df_a_compare.dropna(subset=[key_a])
+            df_b_compare = df_b_compare.dropna(subset=[key_b])
+            
+            df_a_compare[key_a] = df_a_compare[key_a].astype(str).str.strip()
+            df_b_compare[key_b] = df_b_compare[key_b].astype(str).str.strip()
+            
+            # Rename key columns to match
+            df_a_compare = df_a_compare.rename(columns={key_a: 'key'})
+            df_b_compare = df_b_compare.rename(columns={key_b: 'key'})
+            
+            # Remove rows with empty keys
+            df_a_compare = df_a_compare[df_a_compare['key'].str.strip() != '']
+            df_b_compare = df_b_compare[df_b_compare['key'].str.strip() != '']
+            
+            # Find rows only in A
+            only_in_a = df_a_compare[~df_a_compare['key'].isin(df_b_compare['key'])]
+            
+            # Find rows only in B  
+            only_in_b = df_b_compare[~df_b_compare['key'].isin(df_a_compare['key'])]
+            
+            # Find common rows
+            common_keys = set(df_a_compare['key']) & set(df_b_compare['key'])
+            
+            # Find mismatches in common rows
+            mismatches = []
+            for key in common_keys:
+                try:
+                    rows_a = df_a_compare[df_a_compare['key'] == key]
+                    rows_b = df_b_compare[df_b_compare['key'] == key]
                     
-                    # Convert to string for comparison to handle different data types
-                    val_a_str = str(val_a).strip() if pd.notna(val_a) else ""
-                    val_b_str = str(val_b).strip() if pd.notna(val_b) else ""
-                    
-                    if val_a_str != val_b_str:
-                        mismatch_found = True
-                        mismatch_details[f'{col_a}_A'] = val_a
-                        mismatch_details[f'{col_b}_B'] = val_b
-                    else:
-                        mismatch_details[f'{col_a}_A'] = val_a
-                        mismatch_details[f'{col_b}_B'] = val_b
-                
-                if mismatch_found:
-                    mismatches.append(mismatch_details)
-        
-        return {
-            'only_in_a': only_in_a,
-            'only_in_b': only_in_b,
-            'mismatches': pd.DataFrame(mismatches) if mismatches else pd.DataFrame(),
-            'total_a': len(df_a_compare),
-            'total_b': len(df_b_compare),
-            'common_count': len(common_keys)
-        }
+                    if len(rows_a) > 0 and len(rows_b) > 0:
+                        # Use first occurrence if there are duplicates
+                        row_a = rows_a.iloc[0]
+                        row_b = rows_b.iloc[0]
+                        
+                        # Compare selected columns
+                        mismatch_found = False
+                        mismatch_details = {'key': key}
+                        
+                        for col_a, col_b in zip(cols_a, cols_b):
+                            val_a = row_a.get(col_a, '')
+                            val_b = row_b.get(col_b, '')
+                            
+                            # Convert to string for comparison to handle different data types
+                            val_a_str = str(val_a).strip() if pd.notna(val_a) else ""
+                            val_b_str = str(val_b).strip() if pd.notna(val_b) else ""
+                            
+                            mismatch_details[f'{col_a}_A'] = val_a
+                            mismatch_details[f'{col_b}_B'] = val_b
+                            
+                            if val_a_str != val_b_str:
+                                mismatch_found = True
+                        
+                        if mismatch_found:
+                            mismatches.append(mismatch_details)
+                            
+                except Exception as e:
+                    st.warning(f"Error comparing key '{key}': {str(e)}")
+                    continue
+            
+            return {
+                'only_in_a': only_in_a,
+                'only_in_b': only_in_b,
+                'mismatches': pd.DataFrame(mismatches) if mismatches else pd.DataFrame(),
+                'total_a': len(df_a_compare),
+                'total_b': len(df_b_compare),
+                'common_count': len(common_keys)
+            }
+            
+        except Exception as e:
+            st.error(f"Error during comparison: {str(e)}")
+            return None
     
     def create_download_link(self, df, filename, file_format='csv'):
         """Create download link for dataframe"""
@@ -247,23 +332,44 @@ class CSVReconciliationTool:
             
             if file_a:
                 try:
-                    df_a_raw = pd.read_csv(file_a, encoding='utf-8')
-                except:
-                    df_a_raw = pd.read_csv(file_a, encoding='latin-1')
-                
-                st.success(f"✅ Loaded {len(df_a_raw)} rows")
-                
-                # Preview raw data
-                with st.expander("Preview Raw Data"):
-                    st.dataframe(df_a_raw.head(10))
-                
-                # Process data
-                df_a_clean = self.preprocess_csv(df_a_raw)
-                st.session_state.file_a_processed = df_a_clean
-                
-                st.markdown('<div class="success-box">📋 File A processed successfully!</div>', unsafe_allow_html=True)
-                with st.expander("Preview Cleaned Data"):
-                    st.dataframe(df_a_clean.head())
+                    # Try to read with UTF-8 encoding first
+                    try:
+                        df_a_raw = pd.read_csv(file_a, encoding='utf-8')
+                    except UnicodeDecodeError:
+                        # Fallback to latin-1 encoding
+                        file_a.seek(0)  # Reset file pointer
+                        df_a_raw = pd.read_csv(file_a, encoding='latin-1')
+                    except Exception as e:
+                        # Try with error handling for malformed CSV
+                        file_a.seek(0)  # Reset file pointer
+                        df_a_raw = pd.read_csv(file_a, encoding='utf-8', on_bad_lines='skip')
+                    
+                    if len(df_a_raw) == 0:
+                        st.error("❌ File A appears to be empty or unreadable")
+                        return
+                    
+                    st.success(f"✅ Loaded {len(df_a_raw)} rows")
+                    
+                    # Preview raw data
+                    with st.expander("Preview Raw Data"):
+                        st.dataframe(df_a_raw.head(10))
+                    
+                    # Process data
+                    df_a_clean = self.preprocess_csv(df_a_raw)
+                    
+                    if len(df_a_clean) == 0:
+                        st.error("❌ File A could not be processed. Please check the file format.")
+                        return
+                    
+                    st.session_state.file_a_processed = df_a_clean
+                    
+                    st.markdown('<div class="success-box">📋 File A processed successfully!</div>', unsafe_allow_html=True)
+                    with st.expander("Preview Cleaned Data"):
+                        st.dataframe(df_a_clean.head())
+                        
+                except Exception as e:
+                    st.error(f"❌ Error loading File A: {str(e)}")
+                    st.info("💡 Try saving your CSV with UTF-8 encoding or check for special characters.")
         
         with col2:
             st.subheader("📄 File B")
@@ -271,23 +377,44 @@ class CSVReconciliationTool:
             
             if file_b:
                 try:
-                    df_b_raw = pd.read_csv(file_b, encoding='utf-8')
-                except:
-                    df_b_raw = pd.read_csv(file_b, encoding='latin-1')
-                
-                st.success(f"✅ Loaded {len(df_b_raw)} rows")
-                
-                # Preview raw data
-                with st.expander("Preview Raw Data"):
-                    st.dataframe(df_b_raw.head(10))
-                
-                # Process data
-                df_b_clean = self.preprocess_csv(df_b_raw)
-                st.session_state.file_b_processed = df_b_clean
-                
-                st.markdown('<div class="success-box">📋 File B processed successfully!</div>', unsafe_allow_html=True)
-                with st.expander("Preview Cleaned Data"):
-                    st.dataframe(df_b_clean.head())
+                    # Try to read with UTF-8 encoding first
+                    try:
+                        df_b_raw = pd.read_csv(file_b, encoding='utf-8')
+                    except UnicodeDecodeError:
+                        # Fallback to latin-1 encoding
+                        file_b.seek(0)  # Reset file pointer
+                        df_b_raw = pd.read_csv(file_b, encoding='latin-1')
+                    except Exception as e:
+                        # Try with error handling for malformed CSV
+                        file_b.seek(0)  # Reset file pointer
+                        df_b_raw = pd.read_csv(file_b, encoding='utf-8', on_bad_lines='skip')
+                    
+                    if len(df_b_raw) == 0:
+                        st.error("❌ File B appears to be empty or unreadable")
+                        return
+                    
+                    st.success(f"✅ Loaded {len(df_b_raw)} rows")
+                    
+                    # Preview raw data
+                    with st.expander("Preview Raw Data"):
+                        st.dataframe(df_b_raw.head(10))
+                    
+                    # Process data
+                    df_b_clean = self.preprocess_csv(df_b_raw)
+                    
+                    if len(df_b_clean) == 0:
+                        st.error("❌ File B could not be processed. Please check the file format.")
+                        return
+                    
+                    st.session_state.file_b_processed = df_b_clean
+                    
+                    st.markdown('<div class="success-box">📋 File B processed successfully!</div>', unsafe_allow_html=True)
+                    with st.expander("Preview Cleaned Data"):
+                        st.dataframe(df_b_clean.head())
+                        
+                except Exception as e:
+                    st.error(f"❌ Error loading File B: {str(e)}")
+                    st.info("💡 Try saving your CSV with UTF-8 encoding or check for special characters.")
         
         if st.session_state.file_a_processed is not None and st.session_state.file_b_processed is not None:
             if st.button("➡️ Next: Select Primary Keys", type="primary"):
